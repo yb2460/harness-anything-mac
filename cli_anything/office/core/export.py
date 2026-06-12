@@ -3,6 +3,7 @@
 将项目 JSON 转换为真实文档文件，通过 WPS COM 自动化完成。
 """
 
+import csv
 import os
 import tempfile
 from typing import Dict, Any, Optional
@@ -16,6 +17,14 @@ try:
     COM_AVAILABLE = True
 except ImportError:
     COM_AVAILABLE = False
+
+try:
+    from cli_anything.office.utils.office_backend import convert_to, get_backend
+    OFFICE_BACKEND_AVAILABLE = True
+except ImportError:
+    OFFICE_BACKEND_AVAILABLE = False
+    convert_to = None
+    get_backend = None
 
 # WPS 文件格式映射
 WPS_FORMAT_MAP = {
@@ -175,13 +184,9 @@ def export(
         RuntimeError: COM 不可用或导出失败
         FileExistsError: 输出文件已存在且未启用覆盖
     """
-    if not COM_AVAILABLE:
-        raise RuntimeError(
-            "WPS COM 自动化不可用。请在 Windows 上运行并确保 WPS Office 已安装。"
-            "此外需安装 pywin32: pip install pywin32"
-        )
-
     preset_info = get_preset_info(preset)
+    if preset_info is None:
+        raise RuntimeError(f"导出预设解析失败: {preset}")
     output_path = os.path.abspath(output_path)
 
     if os.path.exists(output_path) and not overwrite:
@@ -197,7 +202,17 @@ def export(
     if not output_path.lower().endswith(extension):
         output_path = output_path + extension
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not COM_AVAILABLE:
+        return _export_without_com(
+            project=project,
+            output_path=output_path,
+            preset=preset,
+            preset_info=preset_info,
+            overwrite=overwrite,
+        )
 
     # 通过 COM 创建文档并填充内容
     app = None
@@ -243,6 +258,181 @@ def export(
             except Exception:
                 pass
         raise
+
+
+def _export_without_com(
+    project: Dict[str, Any],
+    output_path: str,
+    preset: str,
+    preset_info: Dict[str, Any],
+    overwrite: bool,
+) -> Dict[str, Any]:
+    """在无 WPS COM 环境下导出（优先使用 LibreOffice headless）。"""
+    if (not OFFICE_BACKEND_AVAILABLE) or (convert_to is None) or (get_backend is None):
+        raise RuntimeError(
+            "导出后端不可用：当前环境无 WPS COM，且未找到跨平台 office_backend。"
+        )
+
+    backend = get_backend()
+    if backend != "libreoffice-headless":
+        raise RuntimeError(
+            "当前环境未检测到可用导出后端。"
+            "Windows 需 WPS + pywin32；macOS/Linux 需 LibreOffice。"
+        )
+
+    doc_type = preset_info["doc_type"]
+    fmt = preset_info["format"]
+    extension = preset_info["extension"]
+
+    # 目标格式无需转换时直接输出
+    if doc_type == "writer" and fmt in {"txt", "html"}:
+        content = _build_writer_plain(project) if fmt == "txt" else _build_writer_html(project)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {
+            "output": os.path.abspath(output_path),
+            "format": fmt,
+            "extension": extension,
+            "preset": preset,
+            "file_size": os.path.getsize(output_path),
+            "method": "native-writer-render",
+            "backend": backend,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="office-export-") as tmp:
+        if doc_type == "writer":
+            source_path = os.path.join(tmp, "writer_source.txt")
+            with open(source_path, "w", encoding="utf-8") as f:
+                f.write(_build_writer_plain(project))
+        elif doc_type == "calc":
+            source_path = os.path.join(tmp, "calc_source.csv")
+            _write_calc_csv(project, source_path)
+        else:
+            raise RuntimeError(
+                "当前跨平台导出暂不支持 impress 文稿。"
+                "请在 Windows + WPS COM 环境下导出。"
+            )
+
+        converted = convert_to(
+            input_path=source_path,
+            output_format=fmt,
+            output_path=output_path,
+            overwrite=overwrite,
+        )
+        converted.update({
+            "extension": extension,
+            "preset": preset,
+            "backend": backend,
+        })
+        return converted
+
+
+def _build_writer_plain(project: Dict[str, Any]) -> str:
+    """将 writer 项目内容降级为纯文本。"""
+    lines = []
+    for item in project.get("content", []):
+        t = item.get("type", "paragraph")
+        if t == "heading":
+            text = item.get("text", "")
+            level = max(1, min(int(item.get("level", 1)), 6))
+            lines.append(f"{'#' * level} {text}".rstrip())
+        elif t == "paragraph":
+            lines.append(item.get("text", ""))
+        elif t == "list":
+            list_style = item.get("list_style", "bullet")
+            for i, v in enumerate(item.get("items", []), start=1):
+                prefix = f"{i}." if list_style == "number" else "-"
+                lines.append(f"{prefix} {v}")
+        elif t == "table":
+            rows = item.get("data") or []
+            for row in rows:
+                lines.append("\t".join(str(v) for v in row))
+        elif t == "page_break":
+            lines.append("\f")
+        elif t == "image_ref":
+            lines.append(f"[image] {item.get('path', '')}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_writer_html(project: Dict[str, Any]) -> str:
+    """将 writer 项目内容渲染为 HTML，便于 LibreOffice 转换。"""
+    import html
+
+    parts = ["<html><head><meta charset='utf-8'></head><body>"]
+    for item in project.get("content", []):
+        t = item.get("type", "paragraph")
+        if t == "heading":
+            text = html.escape(item.get("text", ""))
+            level = max(1, min(int(item.get("level", 1)), 6))
+            parts.append(f"<h{level}>{text}</h{level}>")
+        elif t == "paragraph":
+            text = html.escape(item.get("text", ""))
+            parts.append(f"<p>{text}</p>")
+        elif t == "list":
+            tag = "ol" if item.get("list_style") == "number" else "ul"
+            parts.append(f"<{tag}>")
+            for v in item.get("items", []):
+                parts.append(f"<li>{html.escape(str(v))}</li>")
+            parts.append(f"</{tag}>")
+        elif t == "table":
+            parts.append("<table border='1' cellspacing='0' cellpadding='4'>")
+            for row in item.get("data", []):
+                parts.append("<tr>")
+                for v in row:
+                    parts.append(f"<td>{html.escape(str(v))}</td>")
+                parts.append("</tr>")
+            parts.append("</table>")
+        elif t == "image_ref":
+            path = html.escape(item.get("path", ""))
+            parts.append(f"<p>[image] {path}</p>")
+        elif t == "page_break":
+            parts.append("<div style='page-break-after: always;'></div>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def _write_calc_csv(project: Dict[str, Any], output_path: str) -> None:
+    """将 calc 项目首个工作表写为 CSV。"""
+    sheets = project.get("sheets", [])
+    if not sheets:
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            f.write("")
+        return
+
+    cells = sheets[0].get("cells", {})
+    if not cells:
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            f.write("")
+        return
+
+    parsed = []
+    max_row, max_col = 1, 1
+    for ref, cell in cells.items():
+        col_name = ""
+        row_name = ""
+        for ch in ref:
+            if ch.isalpha():
+                col_name += ch.upper()
+            elif ch.isdigit():
+                row_name += ch
+        if not col_name or not row_name:
+            continue
+        col = 0
+        for ch in col_name:
+            col = col * 26 + (ord(ch) - ord("A") + 1)
+        row = int(row_name)
+        value = cell.get("value", "") if isinstance(cell, dict) else cell
+        parsed.append((row, col, value))
+        max_row = max(max_row, row)
+        max_col = max(max_col, col)
+
+    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
+    for row, col, value in parsed:
+        matrix[row - 1][col - 1] = value
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(matrix)
 
 
 def _fill_document(doc, project: Dict[str, Any], doc_type: str) -> None:
